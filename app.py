@@ -803,6 +803,225 @@ Use compliance-safe language. Never say 'confirmed fraud'. Return only the parag
         },
     }
 
+
+def _build_overall_analysis_case(
+    scope: str,
+    filters: dict,
+    transactions_raw: list,
+    txn_count: int,
+) -> dict:
+    """
+    Build an analyst case for overall / bulk / full-batch analysis.
+
+    Supports scopes:
+      full_transaction_batch — entire uploaded dataset (flagged + legitimate)
+      all_flagged            — only flagged/suspicious transactions
+      high_risk / medium_risk / by_account / date_range / by_risk_level — subsets
+    """
+    now = datetime.utcnow().isoformat()
+    case_id = _next_case_id()
+
+    total = txn_count
+    sample = transactions_raw  # up to 50 sent by frontend
+
+    # Compute basic stats from the sample
+    flagged_count = sum(
+        1 for t in sample
+        if t.get("is_fraud") or safe_float(t.get("fraud_score", 0)) >= 0.5
+    )
+    legit_count = len(sample) - flagged_count
+
+    # For full-batch, extrapolate from sample proportion if we have more than sample
+    if scope == "full_transaction_batch" and total > len(sample) and len(sample) > 0:
+        ratio = flagged_count / len(sample)
+        flagged_est = round(total * ratio)
+        legit_est   = total - flagged_est
+    else:
+        flagged_est = flagged_count
+        legit_est   = legit_count
+
+    # Score stats from sample
+    scores = [safe_float(t.get("fraud_score", 0)) for t in sample]
+    scores_pct = [s * 100 if s <= 1 else s for s in scores]
+    avg_score = sum(scores_pct) / len(scores_pct) if scores_pct else 0.0
+    max_score = max(scores_pct) if scores_pct else 0.0
+
+    # Determine overall risk level from average score
+    risk_level = (
+        "HIGH"       if avg_score >= 70 else
+        "SUSPICIOUS" if avg_score >= 50 else
+        "MEDIUM"     if avg_score >= 30 else "LOW"
+    )
+
+    # Scope-specific label and description
+    scope_labels = {
+        "full_transaction_batch": "Full Transaction Batch",
+        "all_flagged":            "All Flagged Transactions",
+        "high_risk":              "High-Risk Transactions",
+        "medium_risk":            "Medium-Risk Transactions",
+        "date_range":             "Date Range",
+        "by_account":             "By Account / Customer",
+        "by_risk_level":          "Custom Risk Level Filter",
+    }
+    scope_label = scope_labels.get(scope, scope.replace("_", " ").title())
+
+    # Build case type and authorities based on overall risk
+    authorities = []
+    case_type   = "overall_suspicious_activity_review"
+    if avg_score >= 70 or max_score >= 85:
+        authorities.append("DCI")
+        case_type = "overall_high_risk_batch_review"
+    if avg_score >= 50 or flagged_est > total * 0.3:
+        authorities.append("FRC")
+    if not authorities:
+        authorities.append("Internal Review Only")
+    authorities = list(dict.fromkeys(authorities))
+
+    # Reasons
+    reasons = []
+    if scope == "full_transaction_batch":
+        reasons.append(f"Full dataset of {total} transactions submitted for operational analysis")
+        if flagged_est > 0:
+            reasons.append(f"{flagged_est} transaction(s) flagged as suspicious by the fraud model")
+        if avg_score > 0:
+            reasons.append(f"Average fraud model score across sample: {avg_score:.1f}%")
+        if max_score >= 70:
+            reasons.append(f"Highest individual score in sample: {max_score:.1f}%")
+    else:
+        reasons.append(f"Scope: {scope_label}")
+        reasons.append(f"{len(sample)} transactions included in analysis sample")
+        if avg_score > 0:
+            reasons.append(f"Average risk score: {avg_score:.1f}%")
+
+    # Evidence items
+    evidence_items = [
+        {"type": "batch_scope",    "label": "Analysis Scope",          "value": scope_label},
+        {"type": "total_count",    "label": "Total Transactions",       "value": str(total)},
+        {"type": "flagged_count",  "label": "Flagged / Suspicious",     "value": str(flagged_est)},
+        {"type": "legit_count",    "label": "Legitimate / Non-Flagged", "value": str(legit_est)},
+        {"type": "avg_score",      "label": "Avg Fraud Score (Sample)", "value": f"{avg_score:.1f}%"},
+        {"type": "max_score",      "label": "Max Fraud Score (Sample)", "value": f"{max_score:.1f}%"},
+        {"type": "sample_size",    "label": "Sample Sent to Backend",   "value": str(len(sample))},
+    ]
+    if filters.get("risk_level"):
+        evidence_items.append({"type": "filter", "label": "Risk Level Filter", "value": filters["risk_level"]})
+    if filters.get("date_from"):
+        evidence_items.append({"type": "filter", "label": "Date From", "value": filters["date_from"]})
+    if filters.get("date_to"):
+        evidence_items.append({"type": "filter", "label": "Date To",   "value": filters["date_to"]})
+    if filters.get("account"):
+        evidence_items.append({"type": "filter", "label": "Account Filter", "value": filters["account"]})
+
+    # Timeline
+    timeline = [
+        {"timestamp": now, "event": "batch_submitted",
+         "description": f"Analyst submitted {scope_label} for overall analysis"},
+        {"timestamp": now, "event": "case_created",
+         "description": "Overall analysis case created and queued for review"},
+    ]
+
+    # Narrative summary — OpenAI if available, rule-based fallback
+    if scope == "full_transaction_batch":
+        summary_fallback = (
+            f"This overall analysis case covers the complete uploaded transaction dataset of "
+            f"{total} records. Of the sampled transactions, {flagged_est} were flagged as "
+            f"suspicious and {legit_est} appear legitimate. The average fraud model score across "
+            f"the sample is {avg_score:.1f}%. This case is recommended for analyst review to "
+            f"assess whether suspicious activity represents isolated incidents or a broader pattern."
+        )
+    else:
+        summary_fallback = (
+            f"This overall analysis case covers {len(sample)} transactions matching the "
+            f"'{scope_label}' scope. The average fraud model score is {avg_score:.1f}% with a "
+            f"maximum of {max_score:.1f}%. Human analyst review is required before any external "
+            f"reporting decision."
+        )
+
+    summary = summary_fallback
+    if openai_client:
+        prompt = f"""Write a 2-3 sentence professional fraud operations case summary for a BATCH analysis.
+Scope: {scope_label} | Total Transactions: {total} | Flagged: {flagged_est} | Legitimate: {legit_est}
+Avg Score: {avg_score:.1f}% | Max Score: {max_score:.1f}% | Risk Level: {risk_level}
+Routing: {', '.join(authorities)}
+Use compliance-safe language. Never say 'confirmed fraud'. Return only the paragraph."""
+        ai_text = call_openai_chat(prompt, fallback=summary_fallback)
+        if ai_text:
+            summary = ai_text
+
+    narrative = (
+        f"OVERALL ANALYSIS CASE REPORT\n{'=' * 50}\n"
+        f"Case ID:            {case_id}\n"
+        f"Analysis Scope:     {scope_label}\n"
+        f"Total Transactions: {total}\n"
+        f"Flagged:            {flagged_est}\n"
+        f"Legitimate:         {legit_est}\n"
+        f"Avg Risk Score:     {avg_score:.1f}%\n"
+        f"Max Risk Score:     {max_score:.1f}%\n"
+        f"Overall Risk Level: {risk_level}\n"
+        f"Routing:            {', '.join(authorities)}\n"
+        f"Date:               {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"SUMMARY\n{'-' * 50}\n{summary}\n\n"
+        f"KEY OBSERVATIONS\n{'-' * 50}\n"
+        + "\n".join(f"  • {r}" for r in reasons)
+        + f"\n\nCONFIDENTIALITY NOTICE\n{'-' * 50}\n"
+          "AI-assisted draft. All findings must be verified by qualified analyst "
+          "personnel before any external submission.\n"
+    )
+
+    return {
+        "case_id":               case_id,
+        "transaction_id":        f"BATCH-{scope.upper()}-{case_id}",
+        "customer_reference":    f"Batch analysis — {scope_label}",
+        "analysis_mode":         "overall_analysis",
+        "scope":                 scope,
+        "filters":               filters,
+        "risk_score":            round(avg_score, 2),
+        "risk_level":            risk_level,
+        "case_type":             case_type,
+        "status":                "pending_review",
+        "recommended_authorities": authorities,
+        "human_review_required": True,
+        "created_at":            now,
+        "last_action":           f"Overall analysis case created — {scope_label}",
+        "confidence_note": (
+            "AI-generated draft from overall batch analysis. "
+            "Analyst confirmation required before any external submission."
+        ),
+        "summary":   summary,
+        "reasons":   reasons,
+        "evidence":  evidence_items,
+        "timeline":  timeline,
+        "recommended_actions": [
+            f"Review overall risk distribution across {total} transactions",
+            "Identify highest-scoring individual transactions for deeper investigation",
+            "Determine whether suspicious activity is isolated or part of a broader pattern",
+            "Document analyst observations before any escalation decision",
+            "Obtain compliance approval before any external reporting",
+        ],
+        "narrative_report": narrative,
+        "structured_report": {
+            "case_id":       case_id,
+            "scope":         scope,
+            "report_type":   case_type,
+            "total_count":   total,
+            "flagged_count": flagged_est,
+            "legit_count":   legit_est,
+            "avg_risk_score": round(avg_score, 2),
+            "risk_level":    risk_level,
+            "report_to":     authorities,
+            "analyst_verification_required": True,
+        },
+        "audit": {
+            "model_version":    "v3.2.1",
+            "prompt_version":   "fraud-report-prompt-v3",
+            "report_timestamp": now,
+            "reviewer_decision": "",
+            "reviewer_notes":   "",
+            "review_timestamp": "",
+        },
+    }
+
+
 # ═════════════════════════════════════════════
 # ROUTES
 # ═════════════════════════════════════════════
@@ -1297,25 +1516,46 @@ def analyst_cases():
             log.exception("GET /analyst/cases failed")
             return jsonify({"success": False, "error": "Failed to fetch cases"}), 500
 
-    # POST — create case
+    # ── POST — create case ───────────────────────────────────────────────────
     try:
         data = request.get_json(silent=True) or {}
+        analysis_mode = data.get("analysis_mode", "single_transaction")
+
+        # ── Overall / Bulk / Full-batch analysis ────────────────────────────
+        if analysis_mode == "overall_analysis":
+            scope            = data.get("scope", "all_flagged")
+            filters          = data.get("filters", {})
+            transactions_raw = data.get("transactions", [])
+            txn_count        = data.get("transaction_count", len(transactions_raw))
+
+            case = _build_overall_analysis_case(scope, filters, transactions_raw, txn_count)
+            analyst_cases_col.insert_one(case)
+            log_admin_action("create_overall_analysis_case", {
+                "case_id": case["case_id"],
+                "scope": scope,
+                "transaction_count": txn_count,
+            })
+            return jsonify({"success": True, "case": _serialize_case(case)}), 201
+
+        # ── Single transaction analysis (default) ───────────────────────────
         transaction_id = data.get("transaction_id")
-        txn_data = data.get("transaction", {})
+        txn_data       = data.get("transaction", {})
         if not transaction_id:
             return jsonify({"success": False, "error": "transaction_id is required"}), 400
 
-        # Build case document
-        case = _build_analyst_case(transaction_id, txn_data)
-
-        # Deduplicate: if a case for this transaction already exists, return it
+        # Deduplicate: return existing case if one already exists for this txn
         existing = analyst_cases_col.find_one({"transaction_id": transaction_id})
         if existing:
             return jsonify({"success": True, "case": _serialize_case(existing)}), 200
 
+        case = _build_analyst_case(transaction_id, txn_data)
         analyst_cases_col.insert_one(case)
-        log_admin_action("create_analyst_case", {"case_id": case["case_id"], "transaction_id": transaction_id})
+        log_admin_action("create_analyst_case", {
+            "case_id": case["case_id"],
+            "transaction_id": transaction_id,
+        })
         return jsonify({"success": True, "case": _serialize_case(case)}), 201
+
     except Exception as e:
         log.exception("POST /analyst/cases failed")
         return jsonify({"success": False, "error": "Failed to create case", "detail": str(e)}), 500
